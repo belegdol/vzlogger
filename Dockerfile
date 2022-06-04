@@ -1,3 +1,5 @@
+ARG DEBIAN_VERSION=buster-slim
+
 ############################
 # STEP 1 build executable binary
 ############################
@@ -23,6 +25,7 @@ RUN apk add --no-cache \
     json-c-dev \
     mosquitto-dev \
     libunistring-dev \
+    libgpiod-dev \
     automake \
     autoconf \
     gtest-dev
@@ -65,6 +68,7 @@ RUN apk add --no-cache \
     libatomic \
     mosquitto-libs \
     libunistring \
+    libgpiod \
     libstdc++ \
     libgcc
 
