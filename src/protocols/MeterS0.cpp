@@ -775,7 +775,7 @@ bool MeterS0::HWIF_GPIO::waitForImpulse(bool &timeout) {
 
 MeterS0::HWIF_GPIOD::HWIF_GPIOD(int gpiopin, const std::list<Option> &options)
 	: _gpiopin(gpiopin), _configureGPIO(true), _debounce_delay_ms(30), _high_count(0),
-	  _high_wait_ms(-1), _chip(NULL), _line(NULL),
+	  _high_wait_ms(-1), _chip(NULL), _line_request(NULL), _event_buffer(NULL),
 	  _ts_next_state_transition({.tv_sec = 0L, .tv_nsec = 0L}), _gpio_line_status(-1),
 	  _state(STATE_LOW) {
 	OptionList optlist;
@@ -817,55 +817,92 @@ MeterS0::HWIF_GPIOD::~HWIF_GPIOD() { _close(); }
 
 bool MeterS0::HWIF_GPIOD::_open() {
 	const char *consumername = "vzlogger-s0";
-	const char *chipname = "gpiochip0"; // this is currently hardcoded since the interesting GPIO
-										// lines are on chip 0 of a raspberry pi
+	const char *chippath = "/dev/gpiochip0"; // this is currently hardcoded since the interesting GPIO
+											   // lines are on chip 0 of a raspberry pi
 
-	_chip = gpiod_chip_open_by_name(chipname);
+	_chip = gpiod_chip_open(chippath);
 	if (!_chip) {
 		throw vz::VZException("open chip failed, errno " + std::to_string(errno));
 	}
 
-	print(log_debug, "get GPIO line %d", "S0", _gpiopin);
-	_line = gpiod_chip_get_line(_chip, _gpiopin);
-	if (!_line) {
+	// configure line settings
+	struct gpiod_line_settings *settings = gpiod_line_settings_new();
+	if (!settings) {
 		_close();
-		throw vz::VZException("get line " + std::to_string(_gpiopin) + " failed, errno " +
-							  std::to_string(errno));
+		throw vz::VZException("line settings allocation failed");
 	}
 
-	int flags = 0;
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+	gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_BOTH);
 	if (_configureGPIO) {
 		print(log_info, "configuring GPIO via GPIOD (active low)", "S0");
-		flags = GPIOD_LINE_REQUEST_FLAG_ACTIVE_LOW;
+		gpiod_line_settings_set_active_low(settings, true);
 	}
 
-	// initialize status based on line status
-	if (gpiod_line_request_input_flags(_line, consumername, flags)) {
+	// configure line config with the pin offset
+	struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+	if (!line_cfg) {
+		gpiod_line_settings_free(settings);
 		_close();
-		throw vz::VZException("line request input failed, errno " + std::to_string(errno));
+		throw vz::VZException("line config allocation failed");
 	}
-	_gpio_line_status = gpiod_line_get_value(_line);
-	if (_gpio_line_status == -1) {
+
+	unsigned int offsets[] = {(unsigned int)_gpiopin};
+	if (gpiod_line_config_add_line_settings(line_cfg, offsets, 1, settings)) {
+		gpiod_line_settings_free(settings);
+		gpiod_line_config_free(line_cfg);
+		_close();
+		throw vz::VZException("add line settings failed, errno " + std::to_string(errno));
+	}
+	gpiod_line_settings_free(settings);
+
+	// configure request config
+	struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+	if (!req_cfg) {
+		gpiod_line_config_free(line_cfg);
+		_close();
+		throw vz::VZException("request config allocation failed");
+	}
+	gpiod_request_config_set_consumer(req_cfg, consumername);
+
+	// request the line
+	print(log_debug, "requesting GPIO line %d", "S0", _gpiopin);
+	_line_request = gpiod_chip_request_lines(_chip, req_cfg, line_cfg);
+	gpiod_request_config_free(req_cfg);
+	gpiod_line_config_free(line_cfg);
+	if (!_line_request) {
+		_close();
+		throw vz::VZException("line request failed, errno " + std::to_string(errno));
+	}
+
+	// allocate edge event buffer
+	_event_buffer = gpiod_edge_event_buffer_new(1);
+	if (!_event_buffer) {
+		_close();
+		throw vz::VZException("edge event buffer allocation failed");
+	}
+
+	// initialize status based on line value
+	enum gpiod_line_value val = gpiod_line_request_get_value(_line_request, _gpiopin);
+	if (val == GPIOD_LINE_VALUE_ERROR) {
 		_close();
 		throw vz::VZException("Read line status failed, errno " + std::to_string(errno));
 	}
+	_gpio_line_status = (val == GPIOD_LINE_VALUE_ACTIVE) ? 1 : 0;
 	_state = (_gpio_line_status) ? STATE_HIGH : STATE_LOW;
-	gpiod_line_release(_line);
-
-	// subscribe to GPIO events
-	if (gpiod_line_request_both_edges_events_flags(_line, consumername, flags)) {
-		_close();
-		throw vz::VZException("line request both edge events failed, errno " +
-							  std::to_string(errno));
-	}
 
 	return true;
 }
 
 bool MeterS0::HWIF_GPIOD::_close() {
-	if (_line) {
-		gpiod_line_release(_line);
-		_line = NULL;
+	if (_event_buffer) {
+		gpiod_edge_event_buffer_free(_event_buffer);
+		_event_buffer = NULL;
+	}
+
+	if (_line_request) {
+		gpiod_line_request_release(_line_request);
+		_line_request = NULL;
 	}
 
 	if (_chip) {
@@ -886,22 +923,25 @@ reported once waitForImpulse is called again. Therefore we implement our own deb
 a state machine.
 */
 bool MeterS0::HWIF_GPIOD::waitForImpulse(bool &timeout) {
-	struct gpiod_line_event event = {{0L, 0L}, -1};
+	int event_type = -1;
+	uint64_t event_timestamp_ns = 0;
 
 	// STATE_HIGH and STATE_LOW: wait 1 sec max before returning and giving the counter thread the
 	// option to exit
-	struct timespec ts_max_wait_for_events = {1L, 0L};
+	int64_t wait_ns = 1000000000LL; // 1 second in nanoseconds
 	if (_state == STATE_DEBOUNCE || _state == STATE_HIGH_WAIT) {
 		// STATE_DEBOUNCE AND STATE_HIGH_WAIT: wait max until next state transition is scheduled
 		struct timespec ts_now = {0L, 0L};
 		clock_gettime(CLOCK_REALTIME, &ts_now);
-		timespec_sub(_ts_next_state_transition, ts_now, ts_max_wait_for_events);
+		struct timespec ts_diff;
+		timespec_sub(_ts_next_state_transition, ts_now, ts_diff);
+		wait_ns = (int64_t)ts_diff.tv_sec * 1000000000LL + ts_diff.tv_nsec;
 	}
 
 	// wait for GPIO events unless we're already at the next state transition
 	int event_wait_result = 0;
-	if (ts_max_wait_for_events.tv_sec >= 0 && ts_max_wait_for_events.tv_nsec >= 0) {
-		event_wait_result = gpiod_line_event_wait(_line, &ts_max_wait_for_events);
+	if (wait_ns >= 0) {
+		event_wait_result = gpiod_line_request_wait_edge_events(_line_request, wait_ns);
 		print(log_debug, "MeterS0:HWIF_GPIOD: wait for gpio line event returned %d", "S0",
 			  event_wait_result);
 	} else {
@@ -913,16 +953,24 @@ bool MeterS0::HWIF_GPIOD::waitForImpulse(bool &timeout) {
 	if (event_wait_result < 0) { // error
 		throw vz::VZException("error waiting for event, errno " + std::to_string(errno));
 	} else if (event_wait_result > 0) { // event received
-		if (gpiod_line_event_read(_line, &event)) {
+		int num_events = gpiod_line_request_read_edge_events(_line_request, _event_buffer, 1);
+		if (num_events < 0) {
 			throw vz::VZException("error reading event, errno " + std::to_string(errno));
 		}
-		print(log_info,
-			  "[%ld.%ld] GPIO event %d (1=rising edge, 2=falling edge) in current state %d", "S0",
-			  event.ts.tv_sec, event.ts.tv_nsec, event.event_type, _state);
-		if (event.event_type == GPIOD_LINE_EVENT_RISING_EDGE) {
-			_gpio_line_status = 1;
-		} else {
-			_gpio_line_status = 0;
+		if (num_events > 0) {
+			struct gpiod_edge_event *event = gpiod_edge_event_buffer_get_event(_event_buffer, 0);
+			event_type = gpiod_edge_event_get_event_type(event);
+			event_timestamp_ns = gpiod_edge_event_get_timestamp_ns(event);
+			print(log_info,
+				  "[%lu.%lu] GPIO event %d (1=rising edge, 2=falling edge) in current state %d", "S0",
+				  (unsigned long)(event_timestamp_ns / 1000000000ULL),
+				  (unsigned long)(event_timestamp_ns % 1000000000ULL),
+				  event_type, _state);
+			if (event_type == GPIOD_EDGE_EVENT_RISING_EDGE) {
+				_gpio_line_status = 1;
+			} else {
+				_gpio_line_status = 0;
+			}
 		}
 	}
 
@@ -930,7 +978,7 @@ bool MeterS0::HWIF_GPIOD::waitForImpulse(bool &timeout) {
 	States newstate = NO_TRANSITION;
 	switch (_state) {
 	case STATE_LOW:
-		if (event_wait_result > 0 && event.event_type == GPIOD_LINE_EVENT_RISING_EDGE) {
+ 	if (event_wait_result > 0 && event_type == GPIOD_EDGE_EVENT_RISING_EDGE) {
 			// if rising edge detected, transition to STATE_DEBOUNCE (if configured),
 			// STATE_HIGH_WAIT (if configured) or directly to STATE_HIGH
 			if (_debounce_delay_ms > 0) {
@@ -964,7 +1012,7 @@ bool MeterS0::HWIF_GPIOD::waitForImpulse(bool &timeout) {
 		}
 		[[fallthrough]]; // STATE_HIGH_WAIT reacts on events the same way as STATE_HIGH
 	case STATE_HIGH:
-		if (event_wait_result > 0 && event.event_type == GPIOD_LINE_EVENT_FALLING_EDGE) {
+ 	if (event_wait_result > 0 && event_type == GPIOD_EDGE_EVENT_FALLING_EDGE) {
 			// if falling edge detected, transition to STATE_DEBOUNCE (if configured) or directly to
 			// STATE_LOW
 			newstate = (_debounce_delay_ms > 0) ? STATE_DEBOUNCE : STATE_LOW;

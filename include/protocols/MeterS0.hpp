@@ -104,7 +104,8 @@ class MeterS0 : public vz::protocol::Protocol {
 		int _high_count;
 		int _high_wait_ms;
 		struct gpiod_chip *_chip;
-		struct gpiod_line *_line;
+		struct gpiod_line_request *_line_request;
+		struct gpiod_edge_event_buffer *_event_buffer;
 		struct timespec _ts_next_state_transition;
 		int _gpio_line_status;
 
