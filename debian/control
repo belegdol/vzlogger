@@ -17,6 +17,7 @@ Build-Depends-Arch:
  uuid-dev,
  libunistring-dev,
  libgmock-dev,
+ libgpiod-dev,
  libgtest-dev,
  pandoc,
  libmosquitto-dev,

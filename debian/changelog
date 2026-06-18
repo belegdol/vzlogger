@@ -1,3 +1,10 @@
+vzlogger (0.8.9+nmu1) UNRELEASED; urgency=medium
+
+  * Non-maintainer upload.
+  * Build the gpiod branch
+
+ -- Julian Sikorski <belegdol+github@gmail.com>  Wed, 17 Jun 2026 17:46:31 +0200
+
 vzlogger (0.8.9) unstable; urgency=medium
 
   * Bumped CMake min. version to 3.5

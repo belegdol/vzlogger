@@ -23,6 +23,7 @@ case "$1" in
             --group --disabled-password --shell /bin/false \
             _vzlogger
         usermod -a -G dialout _vzlogger
+        usermod -a -G gpio _vzlogger
     fi
 
     touch /var/log/vzlogger.log
